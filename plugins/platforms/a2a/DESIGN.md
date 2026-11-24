@@ -101,6 +101,20 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   for rate limiting, the trust gate, message framing, and audit. A shared
   `A2A_BEARER_TOKEN` authenticates as `ip:<addr>`. Nothing in the request
   body can assert identity. Comparisons are constant-time.
+- **Peer authenticators (#131484):** a plugin may call
+  `ctx.register_a2a_peer_authenticator(provider)` — the light answer to the
+  deferred DID / key identity item below: core verifies nothing itself.
+  `provider.authenticate(authorization, client_ip, agent)` runs before the
+  static tokens on every authenticated request (`agent` = the routed
+  served-agent dict): a str is the identity, `None` defers to the next
+  provider and then the tokens, and a raise (`PeerAuthError` or any other)
+  is a 401 that never falls through. A provider with `challenge(did, agent)`
+  / `accept(body, agent)` gets `GET <agent>/peer-auth/challenge?did=` and
+  `POST <agent>/peer-auth` — unauthenticated, rate limited per client IP,
+  JSON in/out; `accept` returns `{identity, token, expires_in}` and the
+  provider recognises its own token later (core keeps no token store). A
+  provider counts as a credential for bind safety; its identities still go
+  through the trust gate.
 - **Trust gate:** `A2A_TRUSTED_PEERS` (or config `a2a.trusted_peers`)
   optionally restricts which authenticated identities may run tasks.
 - **Injection filters:** ALL inbound text (including `/`-prefixed — remote
@@ -137,6 +151,7 @@ them (#11025 requirement). The `a2a_history` tool recalls them by context id.
 | #11025 | Privacy filters + outbound redaction + audit | `security.py` |
 | #11025 | Conversation persistence outside compaction | `protocol.persist_message`, `a2a_history` |
 | #514, #11025 | Auth, localhost-default | `security.authenticate`, `resolve_bind_host` |
+| #131484 | Pluggable peer identity | `security.peer_authenticators`, `adapter._peer_auth` |
 | #56434 | Trusted peer approval | `security.is_trusted_peer` |
 | #56435 | Task completion notifications | push notifications (`_send_push_notification`) |
 | #25176, #689 | Agent↔agent messaging across machines | client tools + inbound adapter |
@@ -149,7 +164,8 @@ them (#11025 requirement). The `a2a_history` tool recalls them by context id.
 - **True task abort:** `tasks/cancel` marks the task canceled and drops the
   reply, but cannot abort the live session's in-flight turn.
 - **DID / Ed25519 identity, OAuth2 scopes, x402 micropayments** (#14559
-  bindu) — heavy, niche; revisit if there's real demand.
+  bindu) in core — heavy, niche. Identity schemes plug in as peer
+  authenticators instead (see Security).
 
 ## Files
 ```

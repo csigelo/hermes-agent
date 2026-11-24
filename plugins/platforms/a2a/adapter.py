@@ -217,19 +217,58 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return self._json(200, adapter._build_card(public_url, agent=agent))
         if subpath == "/metrics":
             return self._json(200, protocol.metrics.snapshot())
+        if subpath == "/peer-auth/challenge" and adapter._security_context.peer_authenticators:
+            return self._peer_auth("challenge", agent)
         if subpath not in ("/", "/health"):
             return self._json(404, {"error": "not found"})
         payload = {"status": "ok", "agent": agent.get("name") or adapter.agent_name}
         # Agent Cards are public; profile/tenant topology is not leaked on remote unauthenticated GETs.
         sec = adapter._security_context
-        if sec.localhost_only() or sec.authenticate(self.headers.get("Authorization"), self._client_ip()) is not None:
+        if sec.localhost_only() or sec.authenticate(self.headers.get("Authorization"), self._client_ip(), agent) is not None:
             payload["served_agents"] = adapter._served_agent_summary(public_url=public_url)
         self._json(200, payload)
 
+    def _peer_auth(self, op: str, agent: dict):
+        """``GET <agent>/peer-auth/challenge?did=`` and ``POST <agent>/peer-auth`` (#131484): unauthenticated by
+        design (they are how a peer gets a credential), so rate limited per client IP. The first provider with
+        ``op`` answers; it mints and later recognises its own token in ``authenticate`` (core stores none)."""
+        adapter = self.adapter
+        provider = next((p for p in adapter._security_context.peer_authenticators if callable(getattr(p, op, None))), None)
+        if provider is None:
+            return self._json(404, {"error": "not found"})
+        if not adapter._peer_auth_limiter.allow(f"ip:{self._client_ip()}"):
+            protocol.metrics.rate_limit_triggers += 1
+            return self._json(429, {"error": "rate limit exceeded"})
+        try:
+            if op == "challenge":
+                arg = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("did", [""])[0].strip()
+            else:
+                length = int(self.headers.get("Content-Length", 0))
+                if length > _MAX_BODY:
+                    return self._json(413, {"error": "payload too large"})
+                arg = json.loads((self.rfile.read(length) if length else b"").decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._json(400, {"error": "parse error"})
+        if not arg or not isinstance(arg, str if op == "challenge" else dict):
+            return self._json(400, {"error": "did required" if op == "challenge" else "body must be a JSON object"})
+        try:
+            result = getattr(provider, op)(arg, agent)
+        except security.PeerAuthError as e:
+            return self._json(401, {"error": str(e) or "unauthorized"})
+        except Exception:
+            logger.warning("A2A: peer authenticator %r %s failed", provider.name, op, exc_info=True)
+            return self._json(401, {"error": "unauthorized"})
+        if not isinstance(result, dict):
+            return self._json(500, {"error": "peer authenticator returned no object"})
+        self._json(200, result)
+
     def do_POST(self):
         adapter = self.adapter
+        route = adapter._route_for_path(self.path)
+        if adapter._security_context.peer_authenticators and route["subpath"].rstrip("/") == "/peer-auth":
+            return self._peer_auth("accept", route["agent"])
         # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
-        identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
+        identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip(), route["agent"])
         if identity is None:
             return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
         if adapter._security_context.localhost_only() and (refusal := security.browser_post_refusal(self.headers)):
@@ -246,7 +285,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         req_id, method = req.get("id"), str(req.get("method", ""))
         params = req["params"] if req.get("params") is not None else {}
         version = (self.headers.get("A2A-Version") or "").strip()
-        route = adapter._route_for_request(self.path, params) if isinstance(params, dict) else {}
+        path_agent, route = route["agent"], adapter._route_for_request(self.path, params) if isinstance(params, dict) else {}
+        if adapter._security_context.peer_authenticators and route.get("agent", path_agent) is not path_agent and \
+                adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip(), route["agent"]) != identity:
+            # v1.0 tenant routing picked another agent than the path did: the provider judges the one served.
+            return self._error(401, req_id, protocol.ERR_UNAUTHORIZED, "unauthorized")
         handler_name, is_v1 = _METHODS.get(method, ("", False))
         # Ordered, lazily-evaluated checks -> (http status, error code, message); first failure wins
         # (the rate limiter must not be consulted for requests rejected before it).
@@ -308,6 +351,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._watchdog_stop = threading.Event()
         # Per-adapter protocol state (not module-global).
         self.tasks, self._turns, self._rate_limiter = protocol.TaskStore(), protocol.TurnTracker(), protocol.RateLimiter()
+        self._peer_auth_limiter = protocol.RateLimiter()  # unauthenticated peer-auth routes, keyed by client IP
         # Pending reply futures: task_id -> (context_id, Future). _pending_order keeps per-context
         # FIFO so adapter.send() — which only knows the context — resolves the oldest task.
         self._pending: dict[str, tuple[str, Future]] = {}

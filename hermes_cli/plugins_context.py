@@ -596,6 +596,23 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
         return handle
 
     @_serialized_replacement
+    def register_a2a_peer_authenticator(self, provider) -> Optional[PluginRegistration]:
+        """Register an A2A peer authenticator (#131484), duck-typed: ``name``, ``authenticate(authorization,
+        client_ip, agent) -> identity | None`` (raise ``PeerAuthError`` to refuse), optional ``challenge(did,
+        agent)`` / ``accept(body, agent)`` behind ``<agent>/peer-auth``. Consulted before the static A2A tokens
+        by adapters started after it, in registration order; profile-scoped, removed on unload."""
+        if not (isinstance(getattr(provider, "name", None), str) and callable(getattr(provider, "authenticate", None))):
+            _facade().logger.warning("Plugin '%s' tried to register an A2A peer authenticator without a "
+                                     "name and authenticate(). Ignoring.", self.manifest.name)
+            return None
+        from plugins.platforms.a2a.security import peer_authenticators as registry
+        return self._register_scoped_provider(
+            provider, kind="a2a_peer_authenticator", base_class=object, registry=registry,
+            label="A2A peer authenticator", normalize=None,
+            register=lambda p, scope: registry.register(p, scope=scope) or True,
+            reject_message="Plugin '%s' A2A peer authenticator rejected: %s")
+
+    @_serialized_replacement
     def register_platform(
         self, name: str, label: str, adapter_factory: Callable, check_fn: Callable,
         validate_config: Callable | None = None, required_env: list | None = None,

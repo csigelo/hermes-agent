@@ -1,7 +1,7 @@
 """A2A security primitives (adapter + client tools). A2A is a *network* surface: bind safety (no
 token => 127.0.0.1 only); peer identity from credentials, never the body (A2A_PEER_TOKENS
-token->name, shared A2A_BEARER_TOKEN => ip:<addr>); inbound injection filtering; outbound
-credential redaction; JSONL audit; trusted-peer allow-list; HMAC push signing; SSRF-safe URLs."""
+token->name, shared A2A_BEARER_TOKEN => ip:<addr>, plugin peer authenticators before both); inbound
+injection filtering; outbound credential redaction; JSONL audit; trusted-peer allow-list; HMAC push signing; SSRF-safe URLs."""
 
 from __future__ import annotations
 
@@ -13,13 +13,25 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
+from agent.provider_registry import ProviderRegistry, exact_key
 from agent.proxy_bypass import is_loopback_host
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from gateway.platforms._shared import profile_scoped as _profile_scoped
 from gateway.platforms._shared import secrets_match
 
 logger = logging.getLogger(__name__)
+
+
+class PeerAuthError(Exception):
+    """Raised by a peer authenticator to refuse a credential: 401, never a fall-through to the static tokens."""
+
+
+# ``ctx.register_a2a_peer_authenticator`` (#131484): duck-typed ``name`` + ``authenticate(authorization,
+# client_ip, agent) -> identity | None``, optional ``challenge(did, agent)`` / ``accept(body, agent)``.
+# Profile-scoped like the other provider registries; adapters capture it at startup, in registration order.
+peer_authenticators: ProviderRegistry[Any] = ProviderRegistry(
+    label="A2A peer-authenticator", provider_cls=object, logger=logger, normalize=exact_key)
 
 
 def _startup_env(name: str) -> str:
@@ -73,6 +85,7 @@ class A2ASecurityContext:
     # A2A_PEER_TOKENS is set but holds no ``name:token`` pair (a bare token): the operator asked for
     # auth, so this never reads as "no token configured" — every request is refused instead (#148961).
     unusable_peer_tokens: bool = False
+    peer_authenticators: tuple = ()  # plugin providers, consulted before the static tokens (#131484)
 
     @classmethod
     def capture(cls) -> A2ASecurityContext:
@@ -81,28 +94,44 @@ class A2ASecurityContext:
         peer_tokens = _parse_peer_tokens(raw_peer_tokens)
         return cls(bearer_token=bearer_token, peer_tokens=tuple(peer_tokens.items()),
                    unusable_peer_tokens=bool(raw_peer_tokens) and not peer_tokens,
+                   peer_authenticators=tuple(peer_authenticators.merged().values()),
                    trusted_peers=_configured_trusted_peers(),
                    allow_all_users=_startup_env("A2A_ALLOW_ALL_USERS").lower() in {"1", "true", "yes"},
                    requested_host=_unbracket(_startup_env("A2A_HOST")) or "127.0.0.1", push_secret=_startup_env("A2A_PUSH_SECRET") or bearer_token)
 
     def localhost_only(self) -> bool:
-        return not (self.bearer_token or self.peer_tokens or self.unusable_peer_tokens)
+        return not (self.bearer_token or self.peer_tokens or self.unusable_peer_tokens or self.peer_authenticators)
 
     def resolve_bind_host(self) -> str:
-        """Localhost unless a token is configured AND a wider host was asked for."""
+        """Localhost unless a token (or a peer authenticator) is configured AND a wider host was asked for."""
         if self.requested_host in {"127.0.0.1", "localhost", "::1"}:
             return self.requested_host
-        if not (self.bearer_token or self.peer_tokens):  # no usable credential: never widen the bind
-            logger.warning("A2A: A2A_HOST=%s ignored — no usable A2A_BEARER_TOKEN or A2A_PEER_TOKENS; "
+        if not (self.bearer_token or self.peer_tokens or self.peer_authenticators):  # never widen without one
+            logger.warning("A2A: A2A_HOST=%s ignored — no usable A2A_BEARER_TOKEN, A2A_PEER_TOKENS or peer authenticator; "
                            "binding to 127.0.0.1. Configure a token to expose A2A remotely.", self.requested_host)
             return "127.0.0.1"
         return self.requested_host
 
-    def authenticate(self, auth_header: Optional[str], client_ip: str = "") -> Optional[str]:
-        """Peer identity or None (401). Localhost-only: ``ip:<addr>``; per-peer token: that
-        peer's name; shared token: ``ip:<addr>``. Constant-time comparisons."""
+    def authenticate(self, auth_header: Optional[str], client_ip: str = "", agent: Optional[dict] = None) -> Optional[str]:
+        """Peer identity or None (401). Localhost-only: ``ip:<addr>``; peer authenticators first, in
+        order (str = identity, None = next, any raise = 401 with no fall-through to the tokens);
+        per-peer token: that peer's name; shared token: ``ip:<addr>``. Constant-time comparisons."""
         if self.localhost_only():
             return f"ip:{client_ip or 'local'}"
+        for provider in self.peer_authenticators:
+            try:
+                identity = provider.authenticate(auth_header, client_ip, agent if agent is not None else {})
+            except PeerAuthError as e:
+                logger.info("A2A: peer authenticator %r refused %s: %s", provider.name, client_ip or "unknown", e)
+                return None
+            except Exception:
+                logger.warning("A2A: peer authenticator %r failed; refusing the request", provider.name, exc_info=True)
+                return None
+            if identity is not None:
+                if isinstance(identity, str) and identity:
+                    return identity
+                logger.warning("A2A: peer authenticator %r returned %r, not an identity; refusing", provider.name, identity)
+                return None
         parts = (auth_header or "").split(None, 1)
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return None

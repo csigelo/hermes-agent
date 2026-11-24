@@ -66,6 +66,11 @@ via `tasks/get`.
 - **Per-peer tokens**: `A2A_PEER_TOKENS="alice:tok1,bob:tok2"` gives each
   remote agent its own credential; that authenticated name (never anything
   in the request body) drives rate limiting, trust, and audit.
+- **Peer authenticator plugins**: a plugin can register
+  `ctx.register_a2a_peer_authenticator(provider)` to authenticate peers
+  another way (key-based DIDs, JWTs); it runs before the tokens, counts as a
+  credential for `A2A_HOST`, and its identities go through
+  `A2A_TRUSTED_PEERS`. See `DESIGN.md`.
 - Inbound text — including `/`-prefixed text — is run through
   prompt-injection filters and framed as untrusted peer input; remote peers
   cannot invoke operator slash commands.
