@@ -231,7 +231,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
     def _peer_auth(self, op: str, agent: dict):
         """``GET <agent>/peer-auth/challenge?did=`` and ``POST <agent>/peer-auth`` (#131484): unauthenticated by
         design (they are how a peer gets a credential), so rate limited per client IP. The first provider with
-        ``op`` answers; it mints and later recognises its own token in ``authenticate`` (core stores none)."""
+        ``op`` answers; it mints and later recognises its own token in ``authenticate`` (core stores none).
+        ``PeerAuthError`` -> 401, ``ValueError`` (bad input) -> 400, anything else -> 401 + a logged traceback."""
         adapter = self.adapter
         provider = next((p for p in adapter._security_context.peer_authenticators if callable(getattr(p, op, None))), None)
         if provider is None:
@@ -246,6 +247,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", 0))
                 if length > _MAX_BODY:
                     return self._json(413, {"error": "payload too large"})
+                if length < 0:  # rfile.read(-1) would read to EOF: unbounded on an unauthenticated route
+                    raise ValueError("negative Content-Length")
                 arg = json.loads((self.rfile.read(length) if length else b"").decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return self._json(400, {"error": "parse error"})
@@ -255,6 +258,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             result = getattr(provider, op)(arg, agent)
         except security.PeerAuthError as e:
             return self._json(401, {"error": str(e) or "unauthorized"})
+        except ValueError as e:  # the provider's own input check (e.g. a malformed DID): the client's fault
+            logger.debug("A2A: peer authenticator %r %s: bad request: %s", provider.name, op, e)
+            return self._json(400, {"error": str(e) or "bad request"})
         except Exception:
             logger.warning("A2A: peer authenticator %r %s failed", provider.name, op, exc_info=True)
             return self._json(401, {"error": "unauthorized"})

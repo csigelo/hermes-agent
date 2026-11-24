@@ -261,11 +261,15 @@ class RateLimiter:
     def __init__(self) -> None:
         self._buckets: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
+        self._swept = time.time()
 
     def allow(self, identity: str) -> bool:
         with self._lock:
             limit = max(1, _env_int("A2A_RATE_LIMIT", _RATE_LIMIT_DEFAULT))
             now = time.time()
+            if now - self._swept > _RATE_WINDOW:  # keys may be unauthenticated client IPs: drop idle buckets
+                self._buckets = defaultdict(deque, {k: b for k, b in self._buckets.items() if b and now - b[-1] <= _RATE_WINDOW})
+                self._swept = now
             bucket = self._buckets[identity]
             while bucket and now - bucket[0] > _RATE_WINDOW:
                 bucket.popleft()

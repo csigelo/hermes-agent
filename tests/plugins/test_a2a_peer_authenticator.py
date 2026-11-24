@@ -7,6 +7,10 @@ any raise is a 401 that never falls through to the static tokens. A provider wit
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -57,6 +61,8 @@ class Minting:
         self.tokens, self.challenge_agents = {}, []
 
     def challenge(self, did, agent):
+        if not did.startswith("did:"):
+            raise ValueError("did: want a DID")
         self.challenge_agents.append(agent.get("slug") or "default")
         return {"did": did, "nonce": "n-1", "ctx": agent.get("slug") or "default"}
 
@@ -154,6 +160,46 @@ def _live(monkeypatch, provider, agents=None):
     return adapter, base
 
 
+class JwtLike:
+    """Authenticate-only provider (a Keycard-style JWT): no challenge/accept, HS256 for the test."""
+
+    name = "jwt"
+    key = b"issuer-key"
+
+    @classmethod
+    def mint(cls, sub, key=None):
+        enc = lambda obj: base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+        head = f"{enc({'alg': 'HS256'})}.{enc({'sub': sub})}"
+        sig = hmac.new(key or cls.key, head.encode(), hashlib.sha256).digest()
+        return f"{head}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
+
+    def authenticate(self, authorization, client_ip, agent):
+        token = (authorization or "").removeprefix("Bearer ").strip()
+        if not token.startswith("eyJ"):
+            return None  # not a JWT: defer
+        head, _, sig = token.rpartition(".")
+        good = base64.urlsafe_b64encode(hmac.new(self.key, head.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+        if not hmac.compare_digest(sig, good):
+            raise PeerAuthError("bad JWT signature")
+        payload = head.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["sub"]
+
+
+def test_an_authenticate_only_provider_coexists_with_a_minting_one(monkeypatch):
+    monkeypatch.setenv("A2A_PEER_TOKENS", "alice:tok-a")
+    jwt, minting = JwtLike(), Minting()
+    _register(jwt)
+    _register(minting)
+    ctx = security.A2ASecurityContext.capture()
+    assert [p.name for p in ctx.peer_authenticators] == ["jwt", "minting"]  # registration order
+    minting.tokens["mint_0"] = DID
+    assert ctx.authenticate("Bearer " + JwtLike.mint("spiffe://acme/agent"), "10.0.0.8", {}) == "spiffe://acme/agent"
+    assert ctx.authenticate("Bearer mint_0", "10.0.0.8", {}) == DID  # jwt deferred, minting answered
+    assert ctx.authenticate("Bearer tok-a", "10.0.0.8", {}) == "alice"  # both deferred
+    assert ctx.authenticate("Bearer " + JwtLike.mint("alice", key=b"forged"), "10.0.0.8", {}) is None
+    assert ctx.authenticate("Bearer mint_7", "10.0.0.8", {}) is None
+
+
 def test_challenge_accept_round_trip_over_http(monkeypatch):
     from tests.plugins.test_a2a_plugin import _send_body
 
@@ -164,6 +210,13 @@ def test_challenge_accept_round_trip_over_http(monkeypatch):
 
     def exercise():
         assert _status("GET", base + "/peer-auth/challenge")[0] == 400  # no did
+        assert _status("GET", base + "/peer-auth/challenge?did=x") == (400, {"error": "did: want a DID"})  # ValueError
+        conn = http.client.HTTPConnection(base.split("//")[1], timeout=15)
+        conn.putrequest("POST", "/peer-auth")
+        conn.putheader("Content-Length", "-1")  # would read to EOF
+        conn.endheaders()
+        assert conn.getresponse().status == 400
+        conn.close()
         code, challenge = _status("GET", base + f"/helper/peer-auth/challenge?did={DID}")
         assert code == 200 and challenge == {"did": DID, "nonce": "n-1", "ctx": "helper"}
         assert _status("POST", base + "/peer-auth", {"did": DID, "sig": "bad"})[0] == 401
@@ -192,6 +245,20 @@ def test_challenge_accept_round_trip_over_http(monkeypatch):
 
     asyncio.run(run())
     assert provider.challenge_agents == ["helper"]  # the routed agent reaches the provider
+
+
+def test_rate_limiter_drops_idle_buckets(monkeypatch):
+    from types import SimpleNamespace
+
+    from plugins.platforms.a2a import protocol
+
+    clock = [1000.0]
+    monkeypatch.setattr(protocol, "time", SimpleNamespace(time=lambda: clock[0]))
+    limiter = protocol.RateLimiter()
+    for i in range(100):
+        assert limiter.allow(f"ip:10.0.0.{i}")
+    clock[0] += 61
+    assert limiter.allow("ip:10.0.1.1") and list(limiter._buckets) == ["ip:10.0.1.1"]
 
 
 def test_peer_auth_routes_are_rate_limited_per_client_ip(monkeypatch):

@@ -111,10 +111,11 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   is a 401 that never falls through. A provider with `challenge(did, agent)`
   / `accept(body, agent)` gets `GET <agent>/peer-auth/challenge?did=` and
   `POST <agent>/peer-auth` — unauthenticated, rate limited per client IP,
-  JSON in/out; `accept` returns `{identity, token, expires_in}` and the
-  provider recognises its own token later (core keeps no token store). A
-  provider counts as a credential for bind safety; its identities still go
-  through the trust gate.
+  JSON in/out (a `ValueError` from either is a 400); `accept` returns
+  `{identity, token, expires_in}` and the provider recognises its own
+  token later (core keeps no token store). A provider counts as a
+  credential for bind safety; its identities still go through the trust
+  gate.
 - **Trust gate:** `A2A_TRUSTED_PEERS` (or config `a2a.trusted_peers`)
   optionally restricts which authenticated identities may run tasks.
 - **Injection filters:** ALL inbound text (including `/`-prefixed — remote
